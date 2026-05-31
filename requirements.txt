@@ -1,0 +1,24 @@
+# RTMO AimBot Enhanced 依赖
+# Jetson AGX Xavier (ARM64 + CUDA 10.2/11.4) + ESP32-S3
+
+# 核心依赖
+numpy>=1.21.0
+opencv-python>=4.5.5
+opencv-contrib-python>=4.5.5
+
+# ESP32通信 (串口)
+pyserial>=3.5
+
+# TensorRT (Jetson系统预装)
+# tensorrt>=8.4.0  # 通过JetPack安装
+# pycuda>=2021.1   # 通过JetPack安装
+
+# GStreamer硬件加速 (Jetson系统预装)
+
+# 开发/测试 (x86开发机)
+# torch>=1.12.0
+# torchvision>=0.13.0
+# mmpose>=1.0.0
+# mmdeploy>=1.0.0
+# onnx>=1.12.0
+# onnxsim>=0.4.0
