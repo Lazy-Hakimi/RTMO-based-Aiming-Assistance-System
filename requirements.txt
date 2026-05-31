@@ -1,0 +1,26 @@
+# RTMO AimBot 依赖
+# 部署于 Jetson AGX Xavier (ARM64 + CUDA 10.2/11.4)
+
+# 核心依赖
+numpy>=1.21.0
+opencv-python>=4.5.5
+opencv-contrib-python>=4.5.5
+
+# TensorRT (Jetson 系统预装)
+# tensorrt>=8.4.0  # 通过 JetPack 安装
+# pycuda>=2021.1  # 通过 JetPack 安装
+
+# 可选：GStreamer 硬件加速 (Jetson 系统预装)
+# 无需额外安装
+
+# 可选：调试可视化
+# matplotlib>=3.5.0
+
+# 开发/测试 (x86 开发机)
+# torch>=1.12.0
+# torchvision>=0.13.0
+# mmpose>=1.0.0
+# mmdeploy>=1.0.0
+# onnx>=1.12.0
+# onnxruntime-gpu>=1.12.0
+# onnxsim>=0.4.0
