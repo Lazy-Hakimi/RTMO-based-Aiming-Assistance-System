@@ -3,9 +3,11 @@
 RTMO AimBot 多线程流水线主程序
 部署于 Jetson AGX Xavier 32GB
 
+支持后端切换: TensorRT (.trt) | ONNX Runtime (.onnx)
+
 流水线架构：
   [CaptureThread]  ──frame_queue(maxsize=1,丢弃旧帧)──>  [InferThread]
-    (V4L2/GStreamer)                                        (预处理→TensorRT→解码→瞄准)
+    (V4L2/GStreamer)                                        (预处理→推理→解码→瞄准)
                                                                   │
   [HIDThread]    <──aim_queue(maxsize=2,丢弃旧指令)──────┘
     (uinput 事件驱动)                                          │
@@ -31,7 +33,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.config import (
     MODEL_CFG, CAPTURE_CFG, AIMING_CFG, MOUSE_CFG, SYS_CFG, PIPELINE_CFG
 )
-from src.tensorrt_wrapper import TrtInferenceEngine, preprocess_image, preprocess_image_fast
 from src.rtmo_decoder import RTMODecoder, draw_debug_info
 from src.aiming_engine import AimingEngine
 from src.mouse_hid import create_mouse_controller
@@ -42,6 +43,23 @@ from src.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# 根据配置动态选择推理后端
+# ============================================================================
+if MODEL_CFG.backend == "tensorrt":
+    from src.tensorrt_wrapper import TrtInferenceEngine, preprocess_image, preprocess_image_fast
+    EngineClass = TrtInferenceEngine
+    logger.info(f"使用后端: TensorRT ({MODEL_CFG.engine_path})")
+elif MODEL_CFG.backend == "onnxruntime":
+    from src.onnxruntime_wrapper import OnnxRuntimeEngine, preprocess_image, preprocess_image_fast
+    EngineClass = OnnxRuntimeEngine
+    logger.info(f"使用后端: ONNX Runtime ({MODEL_CFG.engine_path})")
+else:
+    raise ValueError(
+        f"不支持的 backend: {MODEL_CFG.backend}\\n"
+        f"可选值: 'tensorrt' | 'onnxruntime'"
+    )
 
 
 class ThreadSafeState:
@@ -73,6 +91,7 @@ class AimBotPipeline:
     def __init__(self, engine_path: str, dummy_mouse: bool = False):
         logger.info("=" * 60)
         logger.info("RTMO AimBot 多线程流水线初始化")
+        logger.info(f"推理后端: {MODEL_CFG.backend}")
         logger.info("=" * 60)
 
         self.engine_path = engine_path
@@ -88,9 +107,9 @@ class AimBotPipeline:
         self.aim_queue = queue.Queue(maxsize=PIPELINE_CFG.aim_queue_size)
         self.vis_queue = queue.Queue(maxsize=PIPELINE_CFG.vis_queue_size)
 
-        # 1. 加载 TensorRT 引擎
-        logger.info(f"加载 TensorRT 引擎: {engine_path}")
-        self.engine = TrtInferenceEngine(engine_path)
+        # 1. 加载推理引擎 (根据配置自动选择 TensorRT / ONNX Runtime)
+        logger.info(f"加载模型: {engine_path}")
+        self.engine = EngineClass(engine_path)
 
         # 2. 初始化视频采集
         logger.info(f"初始化视频采集: {CAPTURE_CFG.device}")
@@ -217,7 +236,7 @@ class AimBotPipeline:
                 )
             t_preprocess = (time.time() - t0) * 1000
 
-            # 2. TensorRT 推理
+            # 2. 推理 (TensorRT 或 ONNX Runtime)
             t0 = time.time()
             outputs = self.engine.infer(preprocessed)
             t_infer = (time.time() - t0) * 1000
@@ -422,7 +441,9 @@ class AimBotPipeline:
 def main():
     parser = argparse.ArgumentParser(description="RTMO AimBot for Jetson AGX Xavier (Pipeline Edition)")
     parser.add_argument("--engine", type=str, default=MODEL_CFG.engine_path,
-                       help="TensorRT 引擎路径")
+                       help="模型路径 (.trt 或 .onnx)")
+    parser.add_argument("--backend", type=str, default=MODEL_CFG.backend,
+                       help="推理后端: tensorrt | onnxruntime")
     parser.add_argument("--dummy-mouse", action="store_true",
                        help="使用虚拟鼠标模式 (不实际控制鼠标)")
     parser.add_argument("--debug", action="store_true",
@@ -446,6 +467,12 @@ def main():
     MOUSE_CFG.sensitivity_x = args.sensitivity
     MOUSE_CFG.sensitivity_y = args.sensitivity
 
+    # 命令行可覆盖后端和模型路径
+    if args.backend:
+        MODEL_CFG.backend = args.backend
+    if args.engine:
+        MODEL_CFG.engine_path = args.engine
+
     # 设置日志
     setup_logging(SYS_CFG.log_level)
 
@@ -455,7 +482,7 @@ def main():
         logger.warning("建议: sudo python3 main.py")
 
     # 启动
-    pipeline = AimBotPipeline(args.engine, dummy_mouse=args.dummy_mouse)
+    pipeline = AimBotPipeline(MODEL_CFG.engine_path, dummy_mouse=args.dummy_mouse)
     pipeline.start()
     pipeline.run()
 

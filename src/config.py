@@ -10,9 +10,13 @@ from typing import List, Tuple
 @dataclass
 class ModelConfig:
     """模型配置"""
-    # TensorRT 引擎路径
-    engine_path: str = "models/rtmo_l_640x640.trt"
-    onnx_path: str = "models/rtmo_l_640x640.onnx"
+    # 推理后端: "tensorrt" | "onnxruntime"
+    backend: str = "onnxruntime"
+
+    # 模型路径 (根据后端自动识别扩展名)
+    # tensorrt: .trt | onnxruntime: .onnx
+    engine_path: str = "models/model_fp16.onnx"
+    onnx_path: str = "models/model_fp16.onnx"
 
     # 输入尺寸 (RTMO-l 默认 640x640)
     input_width: int = 640
@@ -32,10 +36,10 @@ class ModelConfig:
     # 关键点数量 (COCO: 17点)
     num_keypoints: int = 17
 
-    # 使用 FP16 推理
+    # 使用 FP16 推理 (TensorRT / ONNX Runtime 均支持)
     fp16: bool = True
 
-    # 工作空间大小 (MB)
+    # 工作空间大小 (MB, 仅 TensorRT 有效)
     workspace_mb: int = 2048
 
 
