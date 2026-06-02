@@ -1,201 +1,337 @@
-                                 Apache License
-                           Version 2.0, January 2004
-                        http://www.apache.org/licenses/
+"""
+压枪补偿模块 (Recoil Compensator)
+实现自动识别开火状态并施加反向鼠标偏移以抵消武器后坐力
 
-   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+核心算法:
+1. 开火检测: 通过自动开火信号 + 目标命中状态判断
+2. 固定模式压枪: 预定义每种武器的后坐力模式，按发数施加反向补偿
+3. 自适应压枪: 根据实际命中位置反馈动态调整后坐力补偿量
+4. 枪口回降模拟: 停止开火后，模拟枪口自然回落过程
 
-   1. Definitions.
+学术参考:
+- FPS游戏后坐力模式分析 (基于《Secrets of Gosu》论文中的职业玩家数据)
+- 低秩近似检测合成后坐力控制 (Application of Low-Rank Approximation via SVD)
+"""
+import logging
+import time
+import random
+from typing import Tuple, Dict, List, Optional, Deque
+from collections import deque
+import numpy as np
 
-      "License" shall mean the terms and conditions for use, reproduction,
-      and distribution as defined by Sections 1 through 9 of this document.
+from src.config import RECOIL_CFG, AIMING_CFG
 
-      "Licensor" shall mean the copyright owner or entity authorized by
-      the copyright owner that is granting the License.
+logger = logging.getLogger(__name__)
 
-      "Legal Entity" shall mean the union of the acting entity and all
-      other entities that control, are controlled by, or are under common
-      control with that entity. For the purposes of this definition,
-      "control" means (i) the power, direct or indirect, to cause the
-      direction or management of such entity, whether by contract or
-      otherwise, or (ii) ownership of fifty percent (50%) or more of the
-      outstanding shares, or (iii) beneficial ownership of such entity.
 
-      "You" (or "Your") shall mean an individual or Legal Entity
-      exercising permissions granted by this License.
+class RecoilPattern:
+    """
+    单武器后坐力模式
+    存储预定义的后坐力偏移序列
+    """
 
-      "Source" form shall mean the preferred form for making modifications,
-      including but not limited to software source code, documentation
-      source, and configuration files.
+    def __init__(self, weapon_name: str, profile: Dict):
+        self.weapon_name = weapon_name
+        self.profile = profile
+        self.vertical_per_shot = profile.get("vertical_per_shot", 2.5)
+        self.horizontal_drift = profile.get("horizontal_drift", 0.3)
+        self.max_compensation = profile.get("max_compensation", 25.0)
+        self.recovery_rate = profile.get("recovery_rate", 0.3)
+        self.bullets_per_pattern = profile.get("bullets_per_pattern", 30)
 
-      "Object" form shall mean any form resulting from mechanical
-      transformation or translation of a Source form, including but
-      not limited to compiled object code, generated documentation,
-      and conversions to other media types.
+        # 预生成后坐力模式 (垂直方向累计偏移)
+        self._pattern_y = []
+        self._pattern_x = []
+        self._generate_pattern()
 
-      "Work" shall mean the work of authorship, whether in Source or
-      Object form, made available under the License, as indicated by a
-      copyright notice that is included in or attached to the work
-      (an example is provided in the Appendix below).
+    def _generate_pattern(self):
+        """生成后坐力模式"""
+        # 垂直偏移: 每发子弹增加一定的垂直上升
+        # 前5-8发上升最快，之后趋于稳定
+        cumulative_y = 0.0
 
-      "Derivative Works" shall mean any work, whether in Source or Object
-      form, that is based on (or derived from) the Work and for which the
-      editorial revisions, annotations, elaborations, or other modifications
-      represent, as a whole, an original work of authorship. For the purposes
-      of this License, Derivative Works shall not include works that remain
-      separable from, or merely link (or bind by name) to the interfaces of,
-      the Work and Derivative Works thereof.
+        for i in range(self.bullets_per_pattern):
+            # 垂直偏移量 (非线性: 前快后慢)
+            if i < 8:
+                shot_rise = self.vertical_per_shot * (1.0 - i * 0.08)
+            else:
+                shot_rise = self.vertical_per_shot * 0.4  # 后期稳定
 
-      "Contribution" shall mean any work of authorship, including
-      the original version of the Work and any modifications or additions
-      to that Work or Derivative Works thereof, that is intentionally
-      submitted to Licensor for inclusion in the Work by the copyright owner
-      or by an individual or Legal Entity authorized to submit on behalf of
-      the copyright owner. For the purposes of this definition, "submitted"
-      means any form of electronic, verbal, or written communication sent
-      to the Licensor or its representatives, including but not limited to
-      communication on electronic mailing lists, source code control systems,
-      and issue tracking systems that are managed by, or on behalf of, the
-      Licensor for the purpose of discussing and improving the Work, but
-      excluding communication that is conspicuously marked or otherwise
-      designated in writing by the copyright owner as "Not a Contribution."
+            # 水平偏移 (随机左右漂移)
+            if i < 10:
+                shot_drift = random.uniform(-self.horizontal_drift, self.horizontal_drift)
+            else:
+                # 后期水平漂移加大 (控枪难度增加)
+                shot_drift = random.uniform(-self.horizontal_drift * 2, self.horizontal_drift * 2)
 
-      "Contributor" shall mean Licensor and any individual or Legal Entity
-      on behalf of whom a Contribution has been received by Licensor and
-      subsequently incorporated within the Work.
+            cumulative_y += shot_rise
 
-   2. Grant of Copyright License. Subject to the terms and conditions of
-      this License, each Contributor hereby grants to You a perpetual,
-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-      copyright license to reproduce, prepare Derivative Works of,
-      publicly display, publicly perform, sublicense, and distribute the
-      Work and such Derivative Works in Source or Object form.
+            self._pattern_y.append(shot_rise)
+            self._pattern_x.append(shot_drift)
 
-   3. Grant of Patent License. Subject to the terms and conditions of
-      this License, each Contributor hereby grants to You a perpetual,
-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-      (except as stated in this section) patent license to make, have made,
-      use, offer to sell, sell, import, and otherwise transfer the Work,
-      where such license applies only to those patent claims licensable
-      by such Contributor that are necessarily infringed by their
-      Contribution(s) alone or by combination of their Contribution(s)
-      with the Work to which such Contribution(s) was submitted. If You
-      institute patent litigation against any entity (including a
-      cross-claim or counterclaim in a lawsuit) alleging that the Work
-      or a Contribution incorporated within the Work constitutes direct
-      or contributory patent infringement, then any patent licenses
-      granted to You under this License for that Work shall terminate
-      as of the date such litigation is filed.
+    def get_compensation(self, shot_number: int) -> Tuple[float, float]:
+        """
+        获取第N发子弹的补偿偏移量
+        
+        Returns:
+            (comp_x, comp_y): 补偿偏移 (反向，用于抵消后坐力)
+        """
+        if shot_number <= 0 or shot_number > len(self._pattern_y):
+            return 0.0, 0.0
 
-   4. Redistribution. You may reproduce and distribute copies of the
-      Work or Derivative Works thereof in any medium, with or without
-      modifications, and in Source or Object form, provided that You
-      meet the following conditions:
+        idx = shot_number - 1
+        comp_y = -self._pattern_y[idx]  # 反向补偿
+        comp_x = -self._pattern_x[idx]
 
-      (a) You must give any other recipients of the Work or
-          Derivative Works a copy of this License; and
+        # 限制最大补偿量
+        comp_y = max(-self.max_compensation, min(self.max_compensation, comp_y))
+        comp_x = max(-self.max_compensation, min(self.max_compensation, comp_x))
 
-      (b) You must cause any modified files to carry prominent notices
-          stating that You changed the files; and
+        return comp_x, comp_y
 
-      (c) You must retain, in the Source form of any Derivative Works
-          that You distribute, all copyright, patent, trademark, and
-          attribution notices from the Source form of the Work,
-          excluding those notices that do not pertain to any part of
-          the Derivative Works; and
+    def get_cumulative_offset(self, shot_number: int) -> Tuple[float, float]:
+        """获取累计后坐力偏移"""
+        if shot_number <= 0:
+            return 0.0, 0.0
 
-      (d) If the Work includes a "NOTICE" text file as part of its
-          distribution, then any Derivative Works that You distribute must
-          include a readable copy of the attribution notices contained
-          within such NOTICE file, excluding those notices that do not
-          pertain to any part of the Derivative Works, in at least one
-          of the following places: within a NOTICE text file distributed
-          as part of the Derivative Works; within the Source form or
-          documentation, if provided along with the Derivative Works; or,
-          within a display generated by the Derivative Works, if and
-          wherever such third-party notices normally appear. The contents
-          of the NOTICE file are for informational purposes only and
-          do not modify the License. You may add Your own attribution
-          notices within Derivative Works that You distribute, alongside
-          or as an addendum to the NOTICE text from the Work, provided
-          that such additional attribution notices cannot be construed
-          as modifying the License.
+        total_y = sum(self._pattern_y[:shot_number])
+        total_x = sum(self._pattern_x[:shot_number])
+        return total_x, total_y
 
-      You may add Your own copyright statement to Your modifications and
-      may provide additional or different license terms and conditions
-      for use, reproduction, or distribution of Your modifications, or
-      for any such Derivative Works as a whole, provided Your use,
-      reproduction, and distribution of the Work otherwise complies with
-      the conditions stated in this License.
 
-   5. Submission of Contributions. Unless You explicitly state otherwise,
-      any Contribution intentionally submitted for inclusion in the Work
-      by You to the Licensor shall be under the terms and conditions of
-      this License, without any additional terms or conditions.
-      Notwithstanding the above, nothing herein shall supersede or modify
-      the terms of any separate license agreement you may have executed
-      with Licensor regarding such Contributions.
+class RecoilCompensator:
+    """
+    压枪补偿器
+    管理开火状态、应用后坐力补偿、枪口回降
+    """
 
-   6. Trademarks. This License does not grant permission to use the trade
-      names, trademarks, service marks, or product names of the Licensor,
-      except as required for reasonable and customary use in describing the
-      origin of the Work and reproducing the content of the NOTICE file.
+    def __init__(self):
+        self.cfg = RECOIL_CFG
 
-   7. Disclaimer of Warranty. Unless required by applicable law or
-      agreed to in writing, Licensor provides the Work (and each
-      Contributor provides its Contributions) on an "AS IS" BASIS,
-      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-      implied, including, without limitation, any warranties or conditions
-      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
-      PARTICULAR PURPOSE. You are solely responsible for determining the
-      appropriateness of using or redistributing the Work and assume any
-      risks associated with Your exercise of permissions under this License.
+        # 武器模式库
+        self.patterns: Dict[str, RecoilPattern] = {}
+        self._load_weapon_profiles()
 
-   8. Limitation of Liability. In no event and under no legal theory,
-      whether in tort (including negligence), contract, or otherwise,
-      unless required by applicable law (such as deliberate and grossly
-      negligent acts) or agreed to in writing, shall any Contributor be
-      liable to You for damages, including any direct, indirect, special,
-      incidental, or consequential damages of any character arising as a
-      result of this License or out of the use or inability to use the
-      Work (including but not limited to damages for loss of goodwill,
-      work stoppage, computer failure or malfunction, or any and all
-      other commercial damages or losses), even if such Contributor
-      has been advised of the possibility of such damages.
+        # 当前状态
+        self.current_weapon = self.cfg.current_weapon
+        self.is_firing = False
+        self.shot_counter = 0
+        self.total_shots = 0
+        self.consecutive_hits = 0
 
-   9. Accepting Warranty or Additional Liability. While redistributing
-      the Work or Derivative Works thereof, You may choose to offer,
-      and charge a fee for, acceptance of support, warranty, indemnity,
-      or other liability obligations and/or rights consistent with this
-      License. However, in accepting such obligations, You may act only
-      on Your own behalf and on Your sole responsibility, not on behalf
-      of any other Contributor, and only if You agree to indemnify,
-      defend, and hold each Contributor harmless for any liability
-      incurred by, or claims asserted against, such Contributor by reason
-      of your accepting any such warranty or additional liability.
+        # 当前累计补偿偏移 (用于枪口回降)
+        self.current_comp_x = 0.0
+        self.current_comp_y = 0.0
 
-   END OF TERMS AND CONDITIONS
+        # 枪口回降状态
+        self.is_recovering = False
+        self.recovery_target_x = 0.0
+        self.recovery_target_y = 0.0
 
-   APPENDIX: How to apply the Apache License to your work.
+        # 自适应压枪数据
+        self.adaptive_offsets_y: Deque[float] = deque(maxlen=self.cfg.adaptive_window_size)
+        self.adaptive_offsets_x: Deque[float] = deque(maxlen=self.cfg.adaptive_window_size)
+        self.adaptive_factor = 1.0  # 自适应系数 (1.0=标准)
 
-      To apply the Apache License to your work, attach the following
-      boilerplate notice, with the fields enclosed by brackets "[]"
-      replaced with your own identifying information. (Don't include
-      the brackets!)  The text should be enclosed in the appropriate
-      comment syntax for the file format. We also recommend that a
-      file or class name and description of purpose be included on the
-      same "printed page" as the copyright notice for easier
-      identification within third-party archives.
+        # 开火时间记录
+        self.last_fire_time = 0.0
+        self.fire_start_time = 0.0
 
-   Copyright [yyyy] [name of copyright owner]
+        # 上一帧的瞄准偏移 (用于检测实际偏移)
+        self.last_aim_dx = 0.0
+        self.last_aim_dy = 0.0
 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
+    def _load_weapon_profiles(self):
+        """加载武器配置文件"""
+        for weapon_name, profile in self.cfg.weapon_profiles.items():
+            self.patterns[weapon_name] = RecoilPattern(weapon_name, profile)
+        logger.info(f"已加载 {len(self.patterns)} 种武器后坐力模式")
 
-       http://www.apache.org/licenses/LICENSE-2.0
+    def set_weapon(self, weapon_name: str):
+        """切换当前武器"""
+        if weapon_name in self.patterns:
+            self.current_weapon = weapon_name
+            logger.debug(f"切换武器: {weapon_name}")
+        else:
+            logger.warning(f"未知武器 '{weapon_name}'，使用默认配置")
+            self.current_weapon = "default"
 
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
+    def on_fire_start(self):
+        """检测到开火开始"""
+        if not self.cfg.enabled:
+            return
+
+        self.is_firing = True
+        self.is_recovering = False
+        self.fire_start_time = time.time()
+        self.shot_counter = 0
+
+        logger.debug("开火开始")
+
+    def on_fire_stop(self):
+        """检测到开火停止"""
+        if not self.cfg.enabled:
+            return
+
+        self.is_firing = False
+        self.is_recovering = True
+        self.recovery_target_x = 0.0
+        self.recovery_target_y = 0.0
+        self.last_fire_time = time.time()
+        self.consecutive_hits = 0
+
+        # 记录本次连射数据用于自适应学习
+        if self.cfg.mode in ("adaptive", "hybrid") and self.total_shots > 5:
+            self._update_adaptive_factor()
+
+        logger.debug(f"开火停止，本次连射 {self.total_shots} 发")
+        self.total_shots = 0
+
+    def on_shot_fired(self, hit_target: bool = False):
+        """
+        检测到单发子弹发射
+        
+        Args:
+            hit_target: 是否命中目标
+        """
+        if not self.cfg.enabled or not self.is_firing:
+            return
+
+        self.shot_counter += 1
+        self.total_shots += 1
+
+        if hit_target:
+            self.consecutive_hits += 1
+        else:
+            self.consecutive_hits = 0
+
+        # 限制最大压枪发数
+        if self.shot_counter > self.cfg.max_shots_compensated:
+            self.shot_counter = self.cfg.max_shots_compensated
+
+    def get_compensation_offset(self, current_dx: float, current_dy: float) -> Tuple[float, float]:
+        """
+        获取当前帧的压枪补偿偏移量
+        
+        Args:
+            current_dx: 当前帧的水平瞄准偏移
+            current_dy: 当前帧的垂直瞄准偏移
+            
+        Returns:
+            (comp_offset_x, comp_offset_y): 需要额外施加的压枪补偿偏移
+        """
+        if not self.cfg.enabled:
+            return 0.0, 0.0
+
+        self.last_aim_dx = current_dx
+        self.last_aim_dy = current_dy
+
+        # ===== 枪口回降处理 =====
+        if self.is_recovering and not self.is_firing:
+            return self._process_recovery()
+
+        # ===== 开火状态压枪 =====
+        if self.is_firing and self.shot_counter > self.cfg.fire_detect_threshold:
+            return self._compute_firing_compensation()
+
+        return 0.0, 0.0
+
+    def _compute_firing_compensation(self) -> Tuple[float, float]:
+        """计算开火状态的压枪补偿"""
+        pattern = self.patterns.get(self.current_weapon, self.patterns["default"])
+
+        # 获取基础补偿
+        base_comp_x, base_comp_y = pattern.get_compensation(self.shot_counter)
+
+        # 应用自适应系数
+        if self.cfg.mode in ("adaptive", "hybrid"):
+            base_comp_y *= self.adaptive_factor
+            base_comp_x *= self.adaptive_factor
+
+        # 累积补偿
+        self.current_comp_x += base_comp_x
+        self.current_comp_y += base_comp_y
+
+        # 记录用于自适应学习
+        self.adaptive_offsets_x.append(base_comp_x)
+        self.adaptive_offsets_y.append(base_comp_y)
+
+        return base_comp_x, base_comp_y
+
+    def _process_recovery(self) -> Tuple[float, float]:
+        """
+        处理枪口回降
+        停止开火后，逐渐将补偿偏移恢复到0
+        """
+        pattern = self.patterns.get(self.current_weapon, self.patterns["default"])
+        recovery = pattern.recovery_rate
+
+        # 线性回降
+        recovery_x = -self.current_comp_x * recovery
+        recovery_y = -self.current_comp_y * recovery
+
+        self.current_comp_x += recovery_x
+        self.current_comp_y += recovery_y
+
+        # 判断是否回降完成
+        if abs(self.current_comp_x) < 0.5 and abs(self.current_comp_y) < 0.5:
+            self.current_comp_x = 0.0
+            self.current_comp_y = 0.0
+            self.is_recovering = False
+            logger.debug("枪口回降完成")
+
+        return recovery_x, recovery_y
+
+    def _update_adaptive_factor(self):
+        """
+        更新自适应系数
+        根据实际命中情况调整压枪强度
+        """
+        if len(self.adaptive_offsets_y) < 5:
+            return
+
+        # 分析最近命中的散布情况
+        # 如果命中率高但散布大 -> 增加补偿
+        # 如果命中率低 -> 减少补偿或调整方向
+        avg_offset_y = np.mean(list(self.adaptive_offsets_y))
+
+        if self.consecutive_hits >= 3:
+            # 连续命中，补偿合适或略弱
+            self.adaptive_factor = min(1.2, self.adaptive_factor + self.cfg.adaptive_learning_rate)
+        elif self.consecutive_hits == 0:
+            # 连续未命中，补偿可能过强或方向不对
+            self.adaptive_factor = max(0.7, self.adaptive_factor - self.cfg.adaptive_learning_rate * 2)
+
+        self.adaptive_factor = np.clip(self.adaptive_factor, 0.5, 1.5)
+
+        logger.debug(f"自适应系数更新: {self.adaptive_factor:.3f}")
+
+    def get_weapon_list(self) -> List[str]:
+        """获取支持的武器列表"""
+        return list(self.patterns.keys())
+
+    def get_status(self) -> Dict:
+        """获取当前压枪状态信息"""
+        return {
+            "enabled": self.cfg.enabled,
+            "is_firing": self.is_firing,
+            "is_recovering": self.is_recovering,
+            "weapon": self.current_weapon,
+            "shot_counter": self.shot_counter,
+            "adaptive_factor": self.adaptive_factor,
+            "current_comp_x": self.current_comp_x,
+            "current_comp_y": self.current_comp_y,
+        }
+
+    def reset(self):
+        """重置压枪状态"""
+        self.is_firing = False
+        self.is_recovering = False
+        self.shot_counter = 0
+        self.total_shots = 0
+        self.consecutive_hits = 0
+        self.current_comp_x = 0.0
+        self.current_comp_y = 0.0
+        self.adaptive_factor = 1.0
+        self.adaptive_offsets_x.clear()
+        self.adaptive_offsets_y.clear()
